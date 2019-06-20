@@ -158,6 +158,7 @@ if [ $2 = "dcc" ] || [ $2 = "all" ]; then
 	fi
 
 	# setup links to /star folder
+	echo "Setting up links."
 	cd $work_dir/star &&
 	## generate batch directory
 	mkdir -pv ../circtools/01_detect/$batch_name
@@ -189,14 +190,86 @@ if [ $2 = "dcc" ] || [ $2 = "all" ]; then
 			ls *junction | grep -v mate > samplesheet
 	fi
 
+
 	# check if data is unstranded, first-stranded or second-stranded
+	echo "Checking sample strandedness."
+	## for each sample, calculate ratio btw. first strand alignments and total alignments
+	i=0
+	ratio_first=()
 	for dir in `cat $work_dir/.tmp/names.tmp`; do
 		cd $work_dir/star/$dir
-		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$2} END{print sum}'
-		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$3} END{print sum}'
-		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$4} END{print sum}'
-
+		sum_col3=`cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$3} END{print sum}'`
+		sum_col4=`cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$4} END{print sum}'`
+		sum_total=`expr $sum_col3 + $sum_col4`
+		ratio_first[i]=`bc <<< "scale=2; $sum_col3 / $sum_total"`
+		i=`bc <<< "$i+1"`
 	done
+
+	## we use an 85 % ratio as cutoff for classification of strandedness
+	i=0
+	class=()
+	for ratio in ${ratio_first[*]}; do
+		if (( $(bc <<< "$ratio >= .85") )); then class[i]="first-stranded"
+		elif (( $(bc <<< "$ratio < .15")  )); then class[i]="second-stranded"
+		else class[i]="unstranded"
+		fi
+		i=`bc <<< "$i+1"`
+	done
+
+	## check if classifications for all samples are equal
+	i=0
+	ind=()
+	for index in ${!class[*]}; do
+		if [[ ${class[0]} != ${class[$index]} ]]; then
+			ind[i]=$index
+			i=`bc <<< "$i+1"`
+		fi
+	done
+	## give error message if the classifications vary (only output warnings for minority classes)
+	count=`cat ~/testing/.tmp/names.tmp | wc -l`
+	if [ ! -z $ind ]; then
+		for ((i=1; i<=$count; i++)); do
+			if (( $(bc <<< "${#ind[*]} >= `bc <<< "scale=1; $count / 2"`") )); then
+				if [[ ! ${ind[*]} =~ $i ]]; then
+					echo WARNING: `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
+				else echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
+				fi
+			else
+				if [[ ${ind[*]} =~ $i ]]; then
+                                        echo WARNING: `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
+				else echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
+				fi
+			fi
+		done
+		echo "Strandedness classification is determined by a .85 cutoff. If none of the 2 strands reaches the cutoff, the samples are classified as unstranded."
+		class_error () {
+			read -r -p "INPUT DEMAND: Press 1 to continue, 2 to cancel [1/2] " Response
+			case "$Response" in
+				1)
+					;;
+				2) 	exit
+					;;
+ 				*) 	echo "Please try again, you almost had it."
+					return 1
+					;;
+			esac
+ 		}
+		until class_error ; do : ; done
+
+	else
+		for ((i=1; i<=$count; i++)); do
+			echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
+		done
+		echo "Strandedness classification is determined by a .85 cutoff. If none of the 2 strands reaches the cutoff, the samples are classified as unstranded."
+	fi
+#remove these guys after testing!
+fi
+exit
+
+	## get average ratio values
+	sum of ratios / count -> average
+
+
 	#cd ..
 	# Parallel detection:
 	# parallel slurm_circtools_detect.sh [sample names] [paired/unpaired data] [# of cores]
