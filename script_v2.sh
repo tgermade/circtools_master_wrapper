@@ -190,11 +190,13 @@ if [ $2 = "dcc" ] || [ $2 = "all" ]; then
 	fi
 
 	# check if data is unstranded, first-stranded or second-stranded
-	#cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$2} END{print sum}'
-	#cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$3} END{print sum}'
-	#cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$4} END{print sum}'
+	for dir in `cat $work_dir/.tmp/names.tmp`; do
+		cd $work_dir/star/$dir
+		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$2} END{print sum}'
+		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$3} END{print sum}'
+		cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$4} END{print sum}'
 
-
+	done
 	#cd ..
 	# Parallel detection:
 	# parallel slurm_circtools_detect.sh [sample names] [paired/unpaired data] [# of cores]
