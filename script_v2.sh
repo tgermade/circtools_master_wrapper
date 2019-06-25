@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # @Author: Tomas Germade <tgermade>
-# @Date:   Monday, June 3, 2019 11:57
+# @Date:   Monday, June 24, 2019 12:08
 # @Email:  tgermade@student-net.ethz.ch
-# @Project: ETH Zuerich semester project Laboratory of Systems Neuroscience 
+# @Project: ETH Zuerich semester project Laboratory of Systems Neuroscience
 # @Last modified by:   tgermade
-# @Last modified time: Monday, June 3, 2019 11:57
+# @Last modified time: Monday, June 24, 2019 12:08
 
 
 # $1 -> work directory
@@ -14,6 +14,7 @@
 # $4 -> organism (mouse, rat)
 # $5 -> define if read data is paired or not (paired, unpaired)
 # $6 -> maximal number of threads that should be used (default, [num])
+# $7 -> batch name (name for the collection of samples to run)
 
 # One wrapper to rule them all and in a bash script bind them.
 ############################################################################################
@@ -35,7 +36,7 @@ Options:
 	- [batch name]		input unique name for the overall read collection;
 					if no name is given, it will be automatically generated
 					based on the supplied [read files dir]
-					(only affects DCC module!)
+					(only affects DCC module output)
 
 Examples:
 	~/script.sh ~/testing/ fuchs /mnt/schratt/mouse_RNAseR/raw mouse paired default "mouse_GRCm38_RNAseR"
@@ -70,10 +71,14 @@ elif [ $4 = "rat" ] || [ $4 = "rat_assembled"]; then
 	fi
 fi
 
+# get full script path name
+script_path=$(dirname `realpath $0`)
+
 # create work directory if not yet existing
 mkdir -pv $1 &&
 # get full work directory path name
 work_dir=`realpath $1` &&
+
 # get full read file path name
 cd $3 &&
 read_dir=`pwd` &&
@@ -113,6 +118,17 @@ else
 	procs=$6
 fi
 
+# create batch name (name of directory which will contain information for all read samples)
+if [ -z $7 ]; then
+	if [ `echo $(basename $read_dir)` = "raw" ]; then
+      	batch_name=`echo $(dirname $read_dir) | rev | cut -d "/" -f1 | rev`
+	else
+      	batch_name=`echo $(basename $read_dir)`
+	fi
+else
+	batch_name=$7
+fi
+
 ############################################################################################
 # Tools
 #######
@@ -126,15 +142,17 @@ if [ $2 = "star" ] || [ $2 = "all" ]; then
 	cd $read_dir &&
 
 	# different wrapper options depending on paired / unpaired read data
-
 	if [ $5 = "paired" ]; then
-		# parallel slurm_circtools_detect_mapping [STAR index] [target dir] [gene annotation GTF file] [thread number] [Read 1 file] [Read 2 file] [Read 1 marker, e.g. R1]
-		parallel -j1 --xapply ~/slurm_circtools_detect_mapping.sh $star_index $work_dir/star/ $gene_annotation $procs {1} {2} $r1_marker ::: *$r1_marker* ::: *$r2_marker*
-
-	elif [ $5 = "unpaired" ]; then
-		# parallel slurm_circtools_detect_mapping [STAR index] [target dir] [gene annotation GTF file] [thread number] [Read file]
-		parallel -j1 --xapply ~/slurm_circtools_detect_mapping.sh $star_index $work_dir/star/ $gene_annotation $procs {} ::: *
+		align_option=$(echo "{1} {2} $r1_marker ::: *$r1_marker* ::: *$r2_marker*")
+      elif [ $5 = "unpaired" ]; then
+		align_option=$(echo "{} ::: *")
 	fi
+
+	# run STAR
+	# PAIRED: parallel slurm_circtools_detect_mapping [STAR index] [target dir] [gene annotation GTF file] [thread number] [Read 1 file] [Read 2 file] [Read 1 marker, e.g. R1]
+      # UNPAIRED: parallel slurm_circtools_detect_mapping [STAR index] [target dir] [gene annotation GTF file] [thread number] [Read file]
+	echo "Running STAR."
+	parallel -j1 --xapply $script_path/slurm_circtools_detect_mapping.sh $star_index $work_dir/star/ $gene_annotation $procs $align_option
 fi
 
 
@@ -145,17 +163,6 @@ if [ $2 = "dcc" ] || [ $2 = "all" ]; then
 	# create directories
 	mkdir -pv circtools &&
 	mkdir -pv circtools/01_detect &&
-
-	# create batch name (name of directory which will contain information for all read samples)
-	if [ -z $7 ]; then
-		if [ `echo $(basename $read_dir)` = "raw" ]; then
-			batch_name=`echo $(dirname $read_dir) | rev | cut -d "/" -f1 | rev`
-		else
-			batch_name=`echo $(basename $read_dir)`
-		fi
-	else
-		batch_name=$7
-	fi
 
 	# setup links to /star folder
 	echo "Setting up links."
@@ -192,105 +199,148 @@ if [ $2 = "dcc" ] || [ $2 = "all" ]; then
 
 
 	# check if data is unstranded, first-stranded or second-stranded
-	echo "Checking sample strandedness."
+	echo "Checking sample strandedness (.85 cutoff):"
+
+	decideStrandedness () {
+
+		if (( $(echo "$1 >= 0.85" | bc -l) )); then
+			echo "firststrand";
+		elif (( $(echo "$1 <= 0.15" | bc -l) )); then
+			echo "secondstrand";
+		else
+			echo "unstranded";
+		fi
+	}
+
 	## for each sample, calculate ratio btw. first strand alignments and total alignments
-	i=0
-	ratio_first=()
+	sarr=()
+	parr=()
+
 	for dir in `cat $work_dir/.tmp/names.tmp`; do
-		cd $work_dir/star/$dir
-		sum_col3=`cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$3} END{print sum}'`
-		sum_col4=`cat ReadsPerGene.out.tab | awk 'NR >= 5 { print }' | awk '{sum+=$4} END{print sum}'`
-		sum_total=`expr $sum_col3 + $sum_col4`
-		ratio_first[i]=`bc <<< "scale=2; $sum_col3 / $sum_total"`
-		i=`bc <<< "$i+1"`
+            cd $work_dir/star/$dir
+		p=`awk '{if(NR >= 5) { sumF+=$3; sumS+=$4 }} END{print sumF/(sumF+sumS)}' ReadsPerGene.out.tab;`
+		strandcall=`decideStrandedness $p`
+		parr+=($p)
+		sarr+=($strandcall)
+		echo "firststrand ratio: " $f $p "-->" $strandcall
+		cd ..
 	done
 
-	## we use an 85 % ratio as cutoff for classification of strandedness
-	i=0
-	class=()
-	for ratio in ${ratio_first[*]}; do
-		if (( $(bc <<< "$ratio >= .85") )); then class[i]="first-stranded"
-		elif (( $(bc <<< "$ratio < .15")  )); then class[i]="second-stranded"
-		else class[i]="unstranded"
-		fi
-		i=`bc <<< "$i+1"`
-	done
-
-	## check if classifications for all samples are equal
-	i=0
-	ind=()
-	for index in ${!class[*]}; do
-		if [[ ${class[0]} != ${class[$index]} ]]; then
-			ind[i]=$index
-			i=`bc <<< "$i+1"`
-		fi
-	done
-	## give error message if the classifications vary (only output warnings for minority classes)
-	count=`cat ~/testing/.tmp/names.tmp | wc -l`
-	if [ ! -z $ind ]; then
-		for ((i=1; i<=$count; i++)); do
-			if (( $(bc <<< "${#ind[*]} >= `bc <<< "scale=1; $count / 2"`") )); then
-				if [[ ! ${ind[*]} =~ $i ]]; then
-					echo WARNING: `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
-				else echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
-				fi
-			else
-				if [[ ${ind[*]} =~ $i ]]; then
-                                        echo WARNING: `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
-				else echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
-				fi
-			fi
-		done
-		echo "Strandedness classification is determined by a .85 cutoff. If none of the 2 strands reaches the cutoff, the samples are classified as unstranded."
-		class_error () {
-			read -r -p "INPUT DEMAND: Press 1 to continue, 2 to cancel [1/2] " Response
-			case "$Response" in
-				1)
-					;;
-				2) 	exit
-					;;
- 				*) 	echo "Please try again, you almost had it."
-					return 1
-					;;
-			esac
- 		}
-		until class_error ; do : ; done
-
+	# check if all samples of batch share the same strandedness
+	if [ `printf '%s\n' "${sarr[@]}" | sort | uniq | wc -l` -gt 1 ]; then
+		echo "WARNING: not all libraries appear to have the same strand specificity!"
+		# check if (rough) median ratio passes a threshold
+		n=${#parr[@]}
+		strandcall=decideStrandedness `printf '%s\n' "${parr[@]}" | sort -n | tail -n $(( $n / 2 + 1 )) | head -1`
+		echo "Falling back on $strandcall mode, but consider splitting the libraries."
 	else
-		for ((i=1; i<=$count; i++)); do
-			echo `awk "NR==$i" $work_dir/.tmp/names.tmp` found to be ${class[$i-1]} with a first-strand ratio of ${ratio_first[$i-1]}
-		done
-		echo "Strandedness classification is determined by a .85 cutoff. If none of the 2 strands reaches the cutoff, the samples are classified as unstranded."
+		# all calls are identical, take the first
+		strandcall=${sarr[0]}
 	fi
-#remove these guys after testing!
-fi
-exit
 
-	## get average ratio values
-	sum of ratios / count -> average
+	echo "Running DCC on $strandcall mode."
 
 
-	#cd ..
-	# Parallel detection:
-	# parallel slurm_circtools_detect.sh [sample names] [paired/unpaired data] [# of cores]
-	#parallel -j1 --xapply ~/slurm_circtools_detect.sh {} $5 $procs $gene_annotation $genome_reference :::: $work_dir/.tmp/names.tmp
-	~/slurm_circtools_detect.sh "" $5 $procs $gene_annotation $genome_reference
+	# allocate DCC options
+	cd $work_dir/circtools/01_detect/$batch_name
+
+	if [ $strandcall = "unstranded" ]; then
+		strand_option="-N"
+	elif [ $strandcall = "secondstrand" ]; then
+		strand_option="-ss"
+	else strand_otpion=""
+	fi
+
+	if [ $5 = "paired" ]; then
+		paired_option=$(echo "-mt1 @mate1 -mt2 @mate2 -Pi \\")
+	else paired_option=""
+	fi
+
+	# run DCC
+	source activate python27
+
+	circtools detect 	@samplesheet \
+			$paired_option
+	            -D \
+	            -an $gene_annotation \
+	            -F \
+	            -Nr 2 1 \
+	            -fg \
+	            -G \
+	            -A $genome_reference \
+	            -O ./output \
+	            -T $procs \
+	            -B @bam_files.txt \
+			$strand_option
+
+	conda deactivate
 fi
 
 
 # RECONSTRUCTION
 
 if [ $2 = "fuchs" ] || [ $2 = "all" ]; then
-	mkdir -pv circtools
-	mkdir -pv circtools/02_reconstruct
-	# download the wrapper scrips for the reconstruct module (choose the reconstruct wrapper in the home dir! it's adapted to be unpaired compatible)
-	#wget -nc https://raw.githubusercontent.com/dieterich-lab/bioinfo-scripts/master/slurm_circtools_reconstruct.sh
-	# add execute permission
-	#chmod 755 slurm_circtools_reconstruct.sh
+
+	mkdir -pv $work_dir/circtools
+	mkdir -pv $work_dir/circtools/03_reconstruct
 
 	cd $work_dir/circtools/01_detect
 
+
+############################################################################################
+
+	circtools_reconstruct () {
+
+		source activate python27
+
+		# allocation
+		sample_name=$1
+	      main_out=$2/
+		bed_file=$3
+		dcc_dir=$4
+		dcc_out_dir=$5
+		format=$6
+		procs=$7
+		tmp_folder=/tmp/global_tmp/
+
+		main_bam=$dcc_dir/${sample_name}.bam &&
+		main_junction=$dcc_dir/${sample_name}.Chimeric.out.junction &&
+
+		mkdir -p $main_out/${sample_name}
+
+		if [ $format = "paired" ]; then
+		      mate1_bam=$dcc_dir/${sample_name}.mate1.bam &&
+		      mate1_junction=$dcc_dir/${sample_name}.mate1.Chimeric.out.junction &&
+
+		      mate2_bam=$dcc_dir/${sample_name}.mate2.bam &&
+		      mate2_junction=$dcc_dir/${sample_name}.mate2.Chimeric.out.junction.fixed &&
+
+		      merged_bam=$main_out/${sample_name}/${sample_name}_merged.bam
+		fi
+
+		# merge both mate BAM files into one new BAM file
+		if [ $format = "paired" ]; then
+		      samtools merge -l 9 -@ 8 $merged_bam $main_bam $mate1_bam $mate2_bam &&
+		      # re-index the newly aggregated BAM file
+		      samtools index $merged_bam &&
+		      # run FUCHS
+		      FUCHS -N $sample_name -D $dcc_out_dir/CircRNACount -B $merged_bam -A $bed_file -O $main_out/${sample_name} -F $mate1_junction -R $mate2_junction -J $main_junction -T $tmp_folder -p ensembl -r 2 -e 1 -q 2 -P $procs
+
+		elif [ $format = "unpaired" ]; then
+		      # run FUCHS
+		      FUCHS -N $sample_name -D $dcc_out_dir/CircRNACount -B $main_bam -A $bed_file -O $main_out/${sample_name} -J $main_junction -T $tmp_folder -p ensembl -r 2 -e 1 -q 2 -P $procs
+		fi
+
+		conda deactivate
+	}
+
+############################################################################################
+
+	export -f circtools_reconstruct
+
 	# Parallel reconstruction:
-	# parallel slurm_circtools_reconstruct.sh [Sample name] [target dir] [exon annotation BED file] [path to DCC dir] [CircRNACount dir]
-	parallel -j5 --xapply  ~/slurm_circtools_reconstruct.sh {} ../03_reconstruct $exon_annotation ./{} ./{}/output $5 3 :::: ../../.tmp/names.tmp
+	# parallel slurm_circtools_reconstruct.sh [Sample name] [target dir] [exon annotation BED file] [path to DCC dir] [CircRNACount dir] [format: paired reads, unpaired reads] [thread number]
+	echo "Running FUCHS."
+	parallel -j1 --xapply circtools_reconstruct {} ../03_reconstruct $exon_annotation ./$batch_name ./$batch_name/output $5 $procs :::: ../../.tmp/names.tmp
+
 fi
